@@ -1,0 +1,468 @@
+globals [
+  door-waypoint-patch  ;; The patch at the door to be used as an intermediate target (5, -4)
+  counter-queue-patch  ;; The patch where customers line up for service (14, 3)
+  number-of-customer-waiting
+  clerk-increased?
+]
+
+breed [customers customer]
+breed [friends friend]
+
+turtles-own [
+  next-task          ;; Command block: Stores the procedure to run next (e.g., [ -> move-to-target ])
+  target-patch       ;; The patch the turtle is currently trying to reach
+  final-target-patch ;; Holds the final bench patch if an intermediate waypoint is used
+  service-timer      ;; Ticks remaining until service is complete
+  customer-id        ;; Used by friends to link back to the customer (who number)
+]
+
+patches-own [
+  is-bench?          ;; Boolean: true if the patch is a sit-able bench area
+  is-obstacle?       ;; Boolean: true if the patch is a non-traversable wall or counter
+  is-occupied?       ;; Boolean: true if a customer or friend is sitting here or queueing
+  is-reserved?       ;; Boolean: true if a customer/friend is moving toward this patch
+]
+
+to setup
+  clear-all
+  
+  ;; setup only 1 clerk
+  set clerk-increased? false
+  
+  ;; --- Global Variable Setup ---
+  set door-waypoint-patch patch 5 -4
+  set counter-queue-patch patch 14 3
+  
+  ;; --- World and Layout Setup ---
+  setup-layout
+  
+  reset-ticks
+end
+
+to setup-layout
+  ;; Set the floor color
+  ask patches [
+    set pcolor sky + 1 ;; A light blue/grey floor
+    set is-bench? false
+    set is-obstacle? false
+    set is-occupied? false
+    set is-reserved? false
+  ]
+
+  ;; --- 1. Defining Colors ---
+  let bench-color green
+  let counter-color pink
+  let wall-color gray
+  
+  ;; --- World Border Setup ---
+  ask patches with [count neighbors != 8] [
+    set pcolor wall-color
+    set is-obstacle? true
+  ]
+
+  ;; --- 2. Dividing Wall and Doorway ---
+  ask patches with [pxcor = 5 and (pycor < -5 or pycor > -3)] [
+    set pcolor wall-color
+    set is-obstacle? true
+  ]
+
+  ;; --- 3. Counter Area (Center Right) ---
+  ;; Counter obstacle is at pycor 4 to 6
+  ask patches with [pxcor >= 10 and pxcor <= 25 and pycor >= 4 and pycor <= 6] [
+    set pcolor counter-color
+    set is-obstacle? true
+  ]
+
+  ;; --- 4. Bench Row 1 (Top Left) ---
+  ask patches with [pycor = 7 and pxcor >= -17 and pxcor <= 2] [
+    set is-bench? true
+    set pcolor bench-color ;; All 1x1 seats are white
+  ]
+
+  ;; --- 5. Bench Row 2 (Bottom Center-Right) ---
+  ;; Defines 6 individual 1x1 seat patches (pxcor 15 to 20)
+  ask patches with [pycor = -7 and pxcor >= 15 and pxcor <= 20] [
+    set is-bench? true
+    set pcolor bench-color ;; All 1x1 seats are white
+  ]
+end
+
+to generate-customer
+  ;; Use random-poisson to determine the number of customers arriving this tick.
+  let num-arrivals random-poisson mean-arrival-rate
+  
+  ;; Fixed spawn point at the far left entrance
+  let spawn-x -28
+  let spawn-y 0
+
+  repeat num-arrivals [
+    
+    ;; --- 1. Reneging Check (Check population *before* spawning) ---
+    let should-renege false
+    if count turtles > 7 [ 
+      if random-float 1.0 < renege-probability [
+        set should-renege true
+        print "A customer has reneged"
+      ]
+    ]
+    
+    ;; --- 2. Spawn Customer ONLY if no reneging ---
+    ifelse not should-renege [
+      ask patch spawn-x spawn-y [
+        sprout-customers 1 [
+          let current-customer-id who ;; Record the customer's ID for the friend
+          
+          set color blue
+          set size 1.0
+          set service-timer 0
+          set customer-id current-customer-id
+          set target-patch nobody
+          set final-target-patch nobody
+          set heading 90
+          set next-task [ -> find-seat-logic ] ;; Initial state
+          
+          ;; --- Probabilistic Friend Generation (0.2 chance) ---
+          ;; FIX: Use 'hatch' to ensure ID linking works correctly
+          if random-float 1.0 < 0.2 [
+            hatch-friends 1 [
+              set color yellow  ;; Explicitly set yellow (otherwise inherits blue)
+              set size 1.0
+              set service-timer 0
+              set customer-id current-customer-id ;; Link friend to the parent customer
+              set target-patch nobody
+              set final-target-patch nobody
+              set heading 90
+              set next-task [ -> find-seat-logic ] ;; Initial state
+            ]
+          ]
+        ]
+      ]
+    ] 
+    [] 
+  ]
+end
+
+to find-seat-logic 
+  ;; Finds the best available bench and sets the task to move, or sets the task to wait.
+  
+  ;; 1. Define the sets of unoccupied AND unreserved benches
+  let available-benches patches with [is-bench? and not is-occupied? and not is-reserved?]
+  let bottom-right-benches available-benches with [pycor = -7]
+  let top-left-benches available-benches with [pycor = 7]
+
+  let final-bench nobody
+
+  ;; --- PRIORITY LOGIC SIMPLIFIED ---
+  ;; 1. Prioritize Bottom Right (Always preferred)
+  ;; 2. If Bottom Right full, Prioritize Top Left
+  ;; 3. If Top Left full, Wait
+  
+  ifelse any? bottom-right-benches [
+    ;; Priority 1: Bottom Right
+    set final-bench max-one-of bottom-right-benches [pxcor]
+  ] [
+    ;; Priority 2: Top Left (If Bottom Right is full)
+    if any? top-left-benches [
+      set final-bench max-one-of top-left-benches [pxcor]
+    ]
+  ]
+
+  ;; --- ACT ON FINDING/NOT FINDING A BENCH ---
+  ifelse final-bench != nobody [
+    ;; FOUND A SEAT: Claim reservation and set move task
+    ask final-bench [ set is-reserved? true ] 
+    set final-target-patch final-bench
+    set next-task [ -> move-to-target ] 
+    
+    ;; Set the immediate target: Use waypoint if going to bottom-right, otherwise go direct
+    ifelse [pycor] of final-bench = -7 [
+      set target-patch door-waypoint-patch
+    ] [
+      set target-patch final-target-patch
+    ]
+    
+  ] [
+    ;; NO SEAT: Find a waiting spot and set wait task
+    set next-task [ -> wait-for-seat ] 
+    
+    ;; Waiting area: pxcor -28 to 3, pycor -8 to 9
+    ;; Exclude actual benches to ensure they wait on the floor
+    let waiting-area patches with [
+      pxcor >= -28 and pxcor <= 3 and 
+      pycor >= -8 and pycor <= 9 and 
+      not is-occupied? and not is-obstacle? and not is-bench? and not is-reserved?
+    ]
+    
+    ifelse any? waiting-area [
+      let random-waiting-spot one-of waiting-area
+      set target-patch random-waiting-spot
+      ask random-waiting-spot [ set is-reserved? true ]
+      set next-task [ -> move-to-target ] ;; Move to the random spot
+    ] [
+      ;; If no waiting spot, just stay put
+      set target-patch nobody
+      set next-task [ -> wait-for-seat ] ;; Wait where you are
+    ]
+  ]
+end
+
+to move-to-target
+  ;; Handles movement, pathfinding, and arrival transitions.
+  
+  ;; --- ARRIVAL CHECK (Snap to center if close) ---
+  if distance target-patch < 1 [
+    ;; Snap to center of the target patch for precise seating/queueing
+    set xcor [pxcor] of target-patch
+    set ycor [pycor] of target-patch
+    
+    ifelse final-target-patch != nobody and target-patch = door-waypoint-patch [
+      ;; Reached Waypoint: Switch target to the final destination
+      set target-patch final-target-patch
+      set final-target-patch nobody
+    ] [
+      ;; Reached Final Destination (Bench, Queue, or Waiting Spot)
+      
+      ;; Explicitly check for counter queue patch to avoid wrong state transition
+      ifelse patch-here = counter-queue-patch [
+          set next-task [ -> handle-service-states ]
+      ] [
+          set next-task [ -> sitting ] ;; Transition to sitting/waiting logic
+      ]
+      
+      set target-patch nobody
+      stop
+    ]
+  ]
+  
+  ;; --- Movement Logic (Euclidean Gradient Descent Pathfinding) ---
+  let possible-moves neighbors with [not is-obstacle?]
+  let target-x [pxcor] of target-patch
+  let target-y [pycor] of target-patch
+  
+  ifelse any? possible-moves [
+    let best-move min-one-of possible-moves [
+      sqrt ( (target-x - pxcor) ^ 2 + (target-y - pycor) ^ 2 )
+    ]
+    
+    if best-move != nobody [
+      face best-move
+      forward 1
+    ]
+  ]
+  [
+    rt random 90
+    lt random 90
+  ]
+end
+
+to sitting 
+  ;; Handles the actions taken upon arrival at a target patch (bench or waiting spot)
+  
+  set heading 0
+  
+  ask patch-here [ 
+    set is-occupied? true 
+    set is-reserved? false 
+  ]
+  
+  ifelse [is-bench?] of patch-here [
+    ;; Arrived at Bench
+    
+    ifelse breed = customers and [pycor] of patch-here = -7 [
+      ;; Condition A: Bottom-Right Customer - Start service logic
+      set next-task [ -> handle-service-states ] 
+    ] [
+      ;; Condition B: Top-Bench Customer OR Friend - Remain sitting 
+      set next-task [ -> sitting ]
+      
+      ;; Top-Left Customers can still seek upgrade (Upgrade logic moves them to Bottom Right)
+      if breed = customers and [pycor] of patch-here = 7 and ticks mod 10 = 0 [
+        let bottom-right-available patches with [is-bench? and pycor = -7 and not is-occupied? and not is-reserved?]
+        
+        ;; Check for linked friend
+        let my-id who
+        let my-friend one-of friends with [customer-id = my-id]
+        
+        ifelse my-friend != nobody [
+            ;; Case: Customer has a friend. Need 2 seats.
+            if count bottom-right-available >= 2 [
+                ;; Pick Seat 1 for Customer
+                let seat1 max-one-of bottom-right-available [pxcor]
+                ask seat1 [ set is-reserved? true ]
+                
+                ;; Pick Seat 2 for Friend (exclude seat1)
+                let seat2 max-one-of (bottom-right-available with [self != seat1]) [pxcor]
+                ask seat2 [ set is-reserved? true ]
+                
+                ;; Move Friend
+                ask my-friend [
+                    ;; Only clear occupancy if actually sitting on a bench
+                    if [is-bench?] of patch-here [ ask patch-here [ set is-occupied? false ] ]
+                    set color yellow
+                    set final-target-patch seat2
+                    set target-patch door-waypoint-patch
+                    set next-task [ -> move-to-target ]
+                ]
+                
+                ;; Move Self (Customer)
+                ask patch-here [ set is-occupied? false ]
+                set color blue
+                set final-target-patch seat1
+                set target-patch door-waypoint-patch
+                set next-task [ -> move-to-target ]
+                stop
+            ]
+        ] [
+            ;; Case: Solo Customer. Need 1 seat.
+            if any? bottom-right-available [
+              ;; FOUND UPGRADE: Direct reservation and move
+              let upgrade-seat max-one-of bottom-right-available [pxcor]
+              
+              ;; Reserve new seat
+              ask upgrade-seat [ set is-reserved? true ]
+              
+              ;; Clear current seat
+              ask patch-here [ set is-occupied? false ]
+              
+              ;; Set movement parameters manually
+              set final-target-patch upgrade-seat
+              set target-patch door-waypoint-patch ;; Use waypoint for BR
+              set next-task [ -> move-to-target ]
+              stop
+            ]
+        ]
+      ] 
+    ]
+  ] [
+    ;; Arrived at a Waiting Spot
+    set next-task [ -> wait-for-seat ] ;; Transition to waiting state
+  ]
+end
+
+to wait-for-seat
+  ;; Logic for turtles in the overflow queue
+  
+  set heading 0
+  
+  if ticks mod 5 = 0 [
+    let available-benches patches with [is-bench? and not is-occupied? and not is-reserved?]
+    
+    if any? available-benches [
+      ;; Waiting spot is cleared before transitioning
+      ask patch-here [ set is-occupied? false ] 
+      set next-task [ -> find-seat-logic ] ;; Found a seat, re-run logic to reserve and move
+    ]
+  ]
+end
+
+to handle-service-states
+  let queue-patch counter-queue-patch
+  let queue-is-occupied? [is-occupied?] of queue-patch
+  let queue-is-reserved? [is-reserved?] of queue-patch
+  
+  let counter-is-free? not queue-is-occupied? and not queue-is-reserved?
+  
+  ifelse patch-here = queue-patch [
+    ;; --- Stage 2: Service and Departure (At the counter) ---
+    
+    ;; Reservation CLEARANCE and OCCUPANCY setting upon final arrival at counter patch
+    ask queue-patch [
+        set is-reserved? false ; Clear reservation immediately upon arrival
+        set is-occupied? true  ; Mark as occupied
+    ]
+    
+    set color orange ;; Indicate active service
+    
+    ;; Start service timer if needed (only runs once)
+    if service-timer = 0 [
+      set service-timer (round random-poisson mean-service-time) + 1
+    ]
+    
+    ;; Decrement timer (runs every tick)
+    set service-timer service-timer - 1
+    
+    ;; Check for service completion 
+    if service-timer <= 0 [
+      ask patch-here [ set is-occupied? false ] 
+      customer-die ;; Leave the simulation
+    ]
+  ] [
+    ;; --- Stage 1: Queueing/Awaiting Move from Bench ---
+    ifelse counter-is-free? [
+      ;; CLAIM RESERVATION on the queue patch
+      ask queue-patch [ set is-reserved? true ] 
+      
+      ;; Clear bench spot and move
+      ask patch-here [ set is-occupied? false ] ;; Bench spot is free
+      set target-patch queue-patch
+      set next-task [ -> move-to-target ] ;; Move to counter
+      
+    ] [
+      ;; Counter is busy or reserved: Remain sitting
+      set next-task [ -> sitting ] 
+    ]
+  ]
+end
+
+to run-customer-tasks
+  ;; Dispatcher function that runs the appropriate logic based on the turtle's state (next-task)
+  ask turtles [
+    if next-task != nobody [
+      run next-task ;; Executes the command block stored in next-task
+    ]
+  ]
+end
+
+to customer-die 
+  ;; Handles reservation/occupancy clearing and friend departure before a turtle leaves the world
+  
+  ;; 1. Clear current patch status
+  ask patch-here [ 
+    set is-occupied? false 
+    set is-reserved? false 
+  ]
+  
+  ;; 2. Clear initial bench reservation if it was still held (shouldn't happen here, but safe)
+  if final-target-patch != nobody [
+    ask final-target-patch [ set is-reserved? false ]
+  ]
+  
+  ;; 3. Handle Friend Departure (Customer triggers friends to die)
+  if breed = customers [
+      let my-id who ;; Capture the dying customer's ID for comparison
+      ask friends with [customer-id = my-id] [
+          ;; Friends should clear their patch status before dying
+          ask patch-here [ 
+              set is-occupied? false
+              set is-reserved? false
+          ]
+          die
+      ]
+  ]
+  print "A customer has received his/her parcel"
+  die
+  set number-of-customer-waiting number-of-customer-waiting - 1
+end
+
+to increase-clerk
+  
+  if (number-of-customer-waiting > 20) and (not clerk-increased?) [
+    set mean-service-time mean-service-time * 0.5
+    set clerk-increased? true   ;; mark that it already happened
+  ]
+  
+end
+
+
+to go
+  generate-customer
+  run-customer-tasks
+
+  ; Recompute waiting customers every tick
+  set number-of-customer-waiting count turtles with [
+    breed = customers and next-task != [ -> handle-service-states ]
+  ]
+  
+  increase-clerk
+  tick
+end
