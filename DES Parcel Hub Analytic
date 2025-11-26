@@ -1,0 +1,158 @@
+import simpy
+import random
+import statistics
+
+# -----------------------------
+# MODEL PARAMETERS
+# -----------------------------
+MEAN_INTERARRIVAL = 0.67
+MEAN_SERVICE = 7
+RENEGE_THRESHOLD = 8
+RENEGE_PROB = 0.20
+MULTI_PARCEL_PROB = 0.20
+EXTRA_RETRIEVAL_TIME = (1, 3)
+INITIAL_STAFF = 1
+MAX_STAFF = 2
+QUEUE_OPEN_THRESHOLD = 4
+QUEUE_RENEGE_THRESHOLD = 6
+SIM_TIME = 240
+TEMAN_PROB = 0.15
+TEMAN_STAY = (0.3, 1.0)
+
+# -----------------------------
+# METRIC COLLECTION
+# -----------------------------
+waiting_times = []
+service_times = []
+reneged_after_wait = 0
+reneged_preemptive = 0
+served = 0
+teman_count = 0
+staff_open_count = 0
+queue_size_log = []
+customer_queue = []
+
+# -----------------------------
+# TEMAN CUSTOMER PROCESS
+# -----------------------------
+def companion_customer(env, name):
+    global teman_count
+    teman_count += 1
+    stay_time = random.uniform(*TEMAN_STAY)
+    yield env.timeout(stay_time)
+
+# -----------------------------
+# DYNAMIC STAFF MONITOR
+# -----------------------------
+def staff_monitor(env, capacity_container):
+    global staff_open_count
+    while True:
+        yield env.timeout(0.5)
+        current_queue_length = len(customer_queue)
+        if current_queue_length >= QUEUE_OPEN_THRESHOLD and capacity_container.level < MAX_STAFF:
+            yield capacity_container.put(1)
+            staff_open_count += 1
+            print(f"[{env.now:.2f}] Counter OPENED. Queue: {current_queue_length}. Staff: {capacity_container.level}")
+
+# -----------------------------
+# QUEUE LOGGER (EVERY 2 MINUTES)
+# -----------------------------
+def queue_logger(env, capacity_container):
+    while True:
+        # log actual queue length instead of system occupancy
+        current_queue_size = len(customer_queue)
+        queue_size_log.append((env.now, current_queue_size))
+        yield env.timeout(2.0)
+
+# -----------------------------
+# NORMAL CUSTOMER PROCESS
+# -----------------------------
+def normal_customer(env, name, capacity_container):
+    global reneged_after_wait, reneged_preemptive, served
+    arrival_time = env.now
+
+    # Pre-emptive renege based on actual queue length
+    if len(customer_queue) >= QUEUE_RENEGE_THRESHOLD:
+        reneged_preemptive += 1
+        return
+
+    # Join queue & request staff
+    req = capacity_container.get(1)
+    customer_queue.append(req)
+
+    # Wait for service or timeout
+    results = yield req | env.timeout(RENEGE_THRESHOLD)
+
+    # Probabilistic renege
+    if req not in results:
+        if random.random() < RENEGE_PROB:
+            customer_queue.remove(req)
+            reneged_after_wait += 1
+            return
+
+    # Remove from queue once served
+    if req in customer_queue:
+        customer_queue.remove(req)
+
+    # Record waiting time
+    waiting_times.append(env.now - arrival_time)
+
+    # Service time calculation
+    service_time = random.expovariate(1 / MEAN_SERVICE)
+    if random.random() < MULTI_PARCEL_PROB:
+        service_time += random.uniform(*EXTRA_RETRIEVAL_TIME)
+    service_times.append(service_time)
+
+    yield env.timeout(service_time)
+    served += 1
+
+    yield capacity_container.put(1)
+
+# -----------------------------
+# ARRIVAL PROCESS
+# -----------------------------
+def arrival_process(env, capacity_container):
+    customer_id = 0
+    while True:
+        yield env.timeout(random.expovariate(1 / MEAN_INTERARRIVAL))
+        customer_id += 1
+
+        # Teman does not enter queue
+        if random.random() < TEMAN_PROB:
+            env.process(companion_customer(env, f"TEMAN-{customer_id}"))
+        else:
+            env.process(normal_customer(env, f"C{customer_id}", capacity_container))
+
+# -----------------------------
+# RUN SIMULATION
+# -----------------------------
+random.seed(42)
+env = simpy.Environment()
+capacity_container = simpy.Container(env, capacity=MAX_STAFF, init=INITIAL_STAFF)
+
+env.process(arrival_process(env, capacity_container))
+env.process(staff_monitor(env, capacity_container))
+env.process(queue_logger(env, capacity_container))
+
+env.run(until=SIM_TIME)
+
+# -----------------------------
+# RESULTS OUTPUT
+# -----------------------------
+print("\n=== SYSTEM (DISPLAY BOARD) RESULTS ===")
+print(f"Total served                     : {served}")
+print(f"Teman count                      : {teman_count}")
+print(f"Times 2nd staff opened           : {staff_open_count}")
+print("---")
+print(f"Pre-emptive reneged              : {reneged_preemptive}")
+print(f"Reneged after waiting            : {reneged_after_wait}")
+print(f"TOTAL reneged                    : {reneged_preemptive + reneged_after_wait}")
+print("---")
+
+print("\n📊 QUEUE SIZE EVERY 2 MINUTES (Actual Queue Only)")
+for t, q in queue_size_log:
+    print(f"{t:<8.2f} {q}")
+
+print("\nAvg waiting time                 :", statistics.mean(waiting_times) if waiting_times else 0)
+print("Max waiting time                 :", max(waiting_times) if waiting_times else 0)
+print("Avg service time                 :", statistics.mean(service_times) if service_times else 0)
